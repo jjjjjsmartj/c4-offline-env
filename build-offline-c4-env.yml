@@ -1,0 +1,86 @@
+name: Build offline C4 reconstruction environment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out environment files
+        uses: actions/checkout@v6
+
+      - name: Free disk space on temporary runner
+        shell: bash
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          docker system prune -af
+          df -h
+
+      - name: Build environment image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --progress=plain \
+            --tag c4-repro:cu118-v1 \
+            .
+
+      - name: Validate image without a GPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm c4-repro:cu118-v1 bash -lc '
+            python - <<"PY"
+          import pycolmap
+          import torch
+          import torchvision
+          import gsplat
+          print("torch:", torch.__version__)
+          print("CUDA runtime:", torch.version.cuda)
+          print("CUDA available during cloud build:", torch.cuda.is_available())
+          print("torchvision:", torchvision.__version__)
+          print("pycolmap:", pycolmap.__version__)
+          print("gsplat:", gsplat.__file__)
+          PY
+            test -s /opt/c4/models/yolo11x-seg.pt
+            test -s /opt/ProPainter/weights/ProPainter.pth
+            cat /opt/c4/gsplat.commit
+            cat /opt/c4/propainter.commit
+          '
+
+      - name: Export compressed split files
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREFIX='c4-repro-cu118-v1.tar.gz.part-'
+          docker save c4-repro:cu118-v1 |
+            gzip -1 |
+            split -b 1900M -d -a 2 - "$PREFIX"
+          sha256sum ${PREFIX}* > SHA256SUMS.txt
+          docker image inspect c4-repro:cu118-v1 \
+            --format '{{.Id}}' > IMAGE_ID.txt
+          ls -lh ${PREFIX}* SHA256SUMS.txt IMAGE_ID.txt
+          df -h
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create c4-repro-cu118-v1 \
+            c4-repro-cu118-v1.tar.gz.part-* \
+            SHA256SUMS.txt \
+            IMAGE_ID.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title 'C4 reconstruction offline environment cu118 v1' \
+            --notes 'Python 3.10, PyTorch 2.7.1 cu118, pycolmap 4.1.1, gsplat v1.5.3, Ultralytics and ProPainter.'
